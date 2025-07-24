@@ -965,7 +965,7 @@ int __connect_part_one( DMHDBC connection, char *driver_lib, char *driver_name, 
     int fake_unicode;
     char *err;
     struct env_lib_struct *env_lib_list, *env_lib_prev;
-    char txt[ 256 ];
+    char txt[ 531 ];
 
     /*
      * check to see if we want to alter the default threading level
@@ -2445,7 +2445,7 @@ int __connect_part_two( DMHDBC connection )
 #endif
             if ( !(connection -> cl_handle = odbc_dlopen( name, &err )))
             {
-                char txt[ 1024 ];
+                char txt[ ODBC_FILENAME_MAX * 2 + 45 ];
 
 #ifdef HAVE_SNPRINTF
                 snprintf( txt, sizeof( txt ), "Can't open cursor lib '%s' : %s", 
@@ -2900,6 +2900,10 @@ static void close_pooled_connection( CPOOLENT *ptr )
     SQLRETURN ret;
     DMHDBC conn = &ptr -> connection;
 
+    if ( conn -> driver_dbc == NULL ) {
+        return;
+    }
+
     /*
      * disconnect from the driver
      */
@@ -3075,7 +3079,7 @@ static void close_pooled_connection( CPOOLENT *ptr )
 
 /*
  * if a environment gets released from the application, we need to remove any referenvce to that environment 
- * in pooled connections that belong to that environment
+ * in pooled connections that belong to that environment. Also if needed call the release in the driver itself
  */
 
 void __strip_from_pool( DMHENV env )
@@ -3084,10 +3088,6 @@ void __strip_from_pool( DMHENV env )
 
     mutex_pool_entry();
 
-    /*
-     * look in the list of connections for one that matches
-     */
-
     for( ptrh = pool_head; ptrh; ptrh = ptrh -> next )
     {
         CPOOLENT *ptre;
@@ -3095,6 +3095,11 @@ void __strip_from_pool( DMHENV env )
         {
             if ( ptre -> connection.environment == env )
             {
+                /*
+                 * disconnect driver side connection, and when the last the driver side env
+                 */
+                close_pooled_connection( ptre );
+
                 ptre -> connection.environment = NULL;
             }
         }
@@ -3123,7 +3128,18 @@ void pool_unreserve( CPOOLHEAD *pooh )
                     {
                         pool_head = pooh -> next;
                     }
-                    free( pooh -> _driver_connect_string );
+                    if ( pooh -> _driver_connect_string ) {
+                        free( pooh -> _driver_connect_string );
+                    }
+                    if ( pooh -> _server ) {
+                        free( pooh -> _server );
+                    }
+                    if ( pooh -> _user ) {
+                        free( pooh -> _user );
+                    }
+                    if ( pooh -> _password ) {
+                        free( pooh -> _password );
+                    }
                     free( pooh );
                     break;
                 }
@@ -3134,20 +3150,23 @@ void pool_unreserve( CPOOLHEAD *pooh )
     }
 }
 
-static void copy_nts( SQLCHAR *dst, SQLCHAR *src, int *out_length, SQLSMALLINT length )
+static void copy_nts( char **dst, SQLCHAR *src, int *out_length, SQLSMALLINT length )
 {
     if ( src == NULL ) 
     {
-        dst[ 0 ] = '\0';
+        *dst = malloc( 1 );
+        *dst[ 0 ] = '\0';
     }
     else 
     {
         if ( length < 0 )
         {
-            strcpy( dst, src );
+            *dst = malloc( strlen( src ) + 1 );
+            strcpy( *dst, src );
         }
         else
         {
+            *dst = calloc( length + 1, 1 );
             memcpy( dst, src, length );
         }
     }
@@ -3176,19 +3195,19 @@ static int pool_match( CPOOLHEAD *pooh,
             match = 0;
         }
         if ( pooh -> server_length != name_length1 ||
-                sql_strcmp( server_name, (SQLCHAR*)pooh -> server,
+                sql_strcmp( server_name, (SQLCHAR*)pooh -> _server,
                     name_length1, pooh -> server_length ))
         {
             match = 0;
         }
         if ( pooh -> user_length != name_length2 ||
-                sql_strcmp( user_name, (SQLCHAR*)pooh -> user,
+                sql_strcmp( user_name, (SQLCHAR*)pooh -> _user,
                     name_length2, pooh -> user_length ))
         {
             match = 0;
         }
         if ( pooh -> password_length != name_length3 ||
-                sql_strcmp( authentication, (SQLCHAR*)pooh -> password,
+                sql_strcmp( authentication, (SQLCHAR*)pooh -> _password,
                     name_length3, pooh -> password_length ))
         {
             match = 0;
@@ -3209,6 +3228,55 @@ static int pool_match( CPOOLHEAD *pooh,
     }
     return match;
 }
+
+/*
+ * use this variable to spot odd behavour with memory and Python, that looks
+ * like copies of the process memory are replicated and then wound backwards
+ */
+
+/*
+static int ecount;
+
+int display_pool( void )
+{
+    printf( "pool_head: %p %d\n", pool_head, ecount ++ );
+    if ( pool_head ) {
+        CPOOLHEAD *pptr;
+        CPOOLENT *pent;
+
+        pptr = pool_head;
+
+        while( pptr ) {
+
+            printf( "\tpptr: %p\n", pptr );
+            printf( "\t\tdsn: %s\n", pptr -> _driver_connect_string );
+            printf( "\t\tnum_entries: %d\n", pptr -> num_entries );
+            printf( "\t\tentries: %p\n", pptr -> entries );
+            printf( "\t\tnext: %p\n", pptr -> next );
+
+            pent = pptr -> entries;
+            while( pent ) {
+                printf( "\t\t\tpent: %p\n", pent );
+                printf( "\t\t\texpiry_time: %d\n", pent -> expiry_time );
+                printf( "\t\t\tttl: %d\n", pent -> ttl );
+                printf( "\t\t\tin_use: %d\n", pent -> in_use );
+                printf( "\t\t\thead: %p\n", pent -> head );
+                printf( "\t\t\tcursors: %d\n", pent -> cursors );
+                printf( "\t\t\tconnection -> env: %p\n", pent -> connection.environment );
+                printf( "\t\t\tconnection -> driver_env: %p\n", pent -> connection.driver_env );
+                printf( "\t\t\tconnection -> driver_dbc: %p\n", pent -> connection.driver_dbc );
+                printf( "\t\t\tnext: %p\n", pent -> next );
+                printf( "\n" );
+
+                pent = pent -> next;
+            }
+
+            pptr = pptr -> next;
+            printf( "\n" );
+        }
+    }
+}
+*/
 
 /*
  * Search for a matching connection from the pool
@@ -3278,10 +3346,55 @@ restart:;
             }
 
             /*
+             * has it been previously stripped
+             */
+
+            if ( ptre -> connection.environment == NULL ) 
+            {
+                if ( ptre == ptrh -> entries ) /* head of the list ? */
+                {
+                    ptrh -> entries = ptre -> next;
+                }
+                else
+                {
+                    preve -> next = ptre -> next;
+                }
+                free( ptre );
+                ptrh -> num_entries --;
+                pool_signal();
+
+                if ( ! ptrh -> num_entries ) /* free the head too */
+                {
+                    if ( prevh )
+                    {
+                        prevh -> next = ptrh -> next;
+                    }
+                    else
+                    {
+                        pool_head = ptrh -> next;
+                    }
+                    if ( ptrh -> _driver_connect_string ) {
+                        free( ptrh -> _driver_connect_string );
+                    }
+                    if ( ptrh -> _server ) {
+                        free( ptrh -> _server );
+                    }
+                    if ( ptrh -> _user ) {
+                        free( ptrh -> _user );
+                    }
+                    if ( ptrh -> _password ) {
+                        free( ptrh -> _password );
+                    }
+                    free( ptrh );
+                }
+                goto restart;
+            }
+
+            /*
              * has it expired ? Do some cleaning up first
              */
 
-            if ( ptre -> expiry_time < current_time )
+            if ( ptre -> expiry_time < current_time && ptre -> in_use == 0 )
             {
                 /*
                  * disconnect and remove
@@ -3311,7 +3424,18 @@ disconnect_and_remove:
                     {
                         pool_head = ptrh -> next;
                     }
-                    free( ptrh -> _driver_connect_string );
+                    if ( ptrh -> _driver_connect_string ) {
+                        free( ptrh -> _driver_connect_string );
+                    }
+                    if ( ptrh -> _server ) {
+                        free( ptrh -> _server );
+                    }
+                    if ( ptrh -> _user ) {
+                        free( ptrh -> _user );
+                    }
+                    if ( ptrh -> _password ) {
+                        free( ptrh -> _password );
+                    }
                     free( ptrh );
                 }
                 goto restart;
@@ -3348,6 +3472,15 @@ disconnect_and_remove:
             }
 
             /*
+             * we are spanning env's
+             */
+
+            if ( ptre -> connection.environment && ptre -> connection.environment != connection -> environment )
+            {
+                continue;
+            }
+
+            /*
              * ok so far, is it still alive ?
              */
             has_checked = 0;
@@ -3360,42 +3493,71 @@ disconnect_and_remove:
              */
             dead = 0;
 
-            if ((CHECK_SQLGETCONNECTATTR(( &ptre -> connection )) &&
-                    SQL_SUCCEEDED( ret = SQLGETCONNECTATTR(( &ptre -> connection ),
-                        ptre -> connection.driver_dbc,
-                        SQL_ATTR_CONNECTION_DEAD,
-                        &dead,
-                        SQL_IS_INTEGER,
-                        0 ))) ||
-                (CHECK_SQLGETCONNECTATTRW(( &ptre -> connection )) &&
-                    SQL_SUCCEEDED( ret = SQLGETCONNECTATTRW(( &ptre -> connection ),
-                        ptre -> connection.driver_dbc,
-                        SQL_ATTR_CONNECTION_DEAD,
-                        &dead,
-                        SQL_IS_INTEGER,
-                        0 ))) ||
-                (CHECK_SQLGETCONNECTOPTION(( &ptre -> connection )) &&
-                    SQL_SUCCEEDED( ret = SQLGETCONNECTOPTION(( &ptre -> connection ),
-                        ptre -> connection.driver_dbc,
-                        SQL_ATTR_CONNECTION_DEAD,
-                        &dead ))) ||
-                (CHECK_SQLGETCONNECTOPTIONW(( &ptre -> connection )) &&
-                    SQL_SUCCEEDED( ret = SQLGETCONNECTOPTIONW(( &ptre -> connection ),
-                        ptre -> connection.driver_dbc,
-                        SQL_ATTR_CONNECTION_DEAD,
-                        &dead )))
-            )
+            if ( CHECK_SQLGETCONNECTATTR(( &ptre -> connection )))
             {
-                /*
-                 * if it failed assume that it's because it doesn't support
-                 * it, but it's ok
-                 */
-                if ( dead == SQL_CD_TRUE )
+                ret = SQLGETCONNECTATTR(( &ptre -> connection ),
+                        ptre -> connection.driver_dbc,
+                        SQL_ATTR_CONNECTION_DEAD,
+                        &dead,
+                        SQL_IS_INTEGER,
+                        0 );
+                if ( SQL_SUCCEEDED( ret )) 
                 {
-                    goto disconnect_and_remove;
+                    has_checked = 1;
+                    if ( dead == SQL_CD_TRUE )
+                    {
+                        goto disconnect_and_remove;
+                    }
                 }
-                has_checked = 1;
             }
+            if ( !has_checked && CHECK_SQLGETCONNECTATTRW(( &ptre -> connection )))
+            {
+                ret = SQLGETCONNECTATTRW(( &ptre -> connection ),
+                        ptre -> connection.driver_dbc,
+                        SQL_ATTR_CONNECTION_DEAD,
+                        &dead,
+                        SQL_IS_INTEGER,
+                        0 );
+                if ( SQL_SUCCEEDED( ret )) 
+                {
+                    has_checked = 1;
+                    if ( dead == SQL_CD_TRUE )
+                    {
+                        goto disconnect_and_remove;
+                    }
+                }
+            }
+            if ( !has_checked && CHECK_SQLGETCONNECTOPTION(( &ptre -> connection ))) 
+            {
+                    ret = SQLGETCONNECTOPTION(( &ptre -> connection ),
+                        ptre -> connection.driver_dbc,
+                        SQL_ATTR_CONNECTION_DEAD,
+                        &dead );
+                if ( SQL_SUCCEEDED( ret )) 
+                {
+                    has_checked = 1;
+                    if ( dead == SQL_CD_TRUE )
+                    {
+                        goto disconnect_and_remove;
+                    }
+                }
+            }
+            if ( !has_checked && CHECK_SQLGETCONNECTOPTIONW(( &ptre -> connection ))) 
+            {
+                    ret = SQLGETCONNECTOPTIONW(( &ptre -> connection ),
+                        ptre -> connection.driver_dbc,
+                        SQL_ATTR_CONNECTION_DEAD,
+                        &dead );
+                if ( SQL_SUCCEEDED( ret )) 
+                {
+                    has_checked = 1;
+                    if ( dead == SQL_CD_TRUE )
+                    {
+                        goto disconnect_and_remove;
+                    }
+                }
+            }
+
             /*
              * Need some other way of checking, This isn't safe to pool...
              * But it needs to be something thats not slower than connecting...
@@ -3621,19 +3783,10 @@ disconnect_and_remove:
         CPOOLHEAD *newhead = calloc( sizeof( CPOOLHEAD ), 1 );
         if ( newhead )
         {
-            copy_nts( newhead -> server, server_name, &newhead -> server_length, name_length1 );
-            copy_nts( newhead -> user, user_name, &newhead -> user_length, name_length2 );
-            copy_nts( newhead -> password, authentication, &newhead -> password_length, name_length3 );
-            if ( connect_string == NULL ) {
-                newhead -> _driver_connect_string = calloc( 1, 1 );
-            }
-            else if ( connect_string_length < 0 ) {
-                newhead -> _driver_connect_string = calloc( strlen( connect_string ) + 1, 1 );
-            }
-            else {
-                newhead -> _driver_connect_string = calloc( connect_string_length + 1, 1 );
-            }
-            copy_nts( newhead -> _driver_connect_string, connect_string, &newhead -> dsn_length, connect_string_length );
+            copy_nts( &(newhead -> _server), server_name, &newhead -> server_length, name_length1 );
+            copy_nts( &(newhead -> _user), user_name, &newhead -> user_length, name_length2 );
+            copy_nts( &(newhead -> _password), authentication, &newhead -> password_length, name_length3 );
+            copy_nts( &(newhead -> _driver_connect_string), connect_string, &newhead -> dsn_length, connect_string_length );
 
             newhead -> num_entries = 1; /* reserve an entry */
 
@@ -3785,6 +3938,27 @@ void return_to_pool( DMHDBC connection )
                     (SQLPOINTER)(intptr_t) SQL_RESET_CONNECTION_YES,
                     0 );
         }
+        else if ( CHECK_SQLSETCONNECTATTRW( connection ))
+        {
+            SQLSETCONNECTATTRW( connection,
+                    connection -> driver_dbc,
+                    SQL_ATTR_RESET_CONNECTION,
+                    (SQLPOINTER)(intptr_t) SQL_RESET_CONNECTION_YES,
+                    0 );
+        }
+    }
+
+    if ( connection -> cl_handle ) 
+    {
+        /*
+         * slight hack to warn the cursor lib the connection is going away 
+         */
+
+        SQLSETCONNECTATTR( connection,
+                    connection -> driver_dbc,
+                    SQL_ATTR_RESET_CONNECTION,
+                    (SQLPOINTER)(intptr_t) 2,
+                    0 );
     }
 
     /*
@@ -4117,16 +4291,18 @@ retry:
         {
             if ( name_length1 < 0 )
             {
-                strcpy( connection -> server, (char*)server_name );
+                connection -> _server = strdup((char*)server_name );
             }
             else
             {
-                memcpy( connection -> server, server_name, name_length1 );
+                connection -> _server = malloc( name_length1 );
+                memcpy( connection -> _server, server_name, name_length1 );
             }
         }
         else
         {
-            strcpy( connection -> server, "" );
+            connection -> _server = malloc( 1 );
+            strcpy( connection -> _server, "" );
         }
         connection -> server_length = name_length1;
 
@@ -4134,33 +4310,37 @@ retry:
         {
             if ( name_length2 < 0 )
             {
-                strcpy( connection -> user, (char*)user_name );
+                connection -> _user = strdup((char*)user_name );
             }
             else
             {
-                memcpy( connection -> user, user_name, name_length2 );
+                connection -> _user = malloc( name_length2 );
+                memcpy( connection -> _user, user_name, name_length2 );
             }
         }
         else
         {
-            strcpy( connection -> user, "" );
+            connection -> _user = malloc( 1 );
+            strcpy( connection -> _user, "" );
         }
         connection -> user_length = name_length2;
 
         if ( authentication )
         {
-            if ( name_length3 )
+            if ( name_length3 < 0 )
             {
-                strcpy( connection -> password, (char*)authentication );
+                connection -> _password = strdup((char*)authentication );
             }
             else
             {
-                memcpy( connection -> password, authentication, name_length3 );
+                connection -> _password = malloc( name_length3 );
+                memcpy( connection -> _password, authentication, name_length3 );
             }
         }
         else
         {
-            strcpy( connection -> password, "" );
+            connection -> _password = malloc( 1 );
+            strcpy( connection -> _password, "" );
         }
         connection -> password_length = name_length3;
     }
@@ -4396,7 +4576,7 @@ retry:
 
             /*
              * get the errors from the driver before
-             * looseing the connection 
+             * loseing the connection 
              */
 
             if ( CHECK_SQLERRORW( connection ))
@@ -4427,8 +4607,9 @@ retry:
                         as1 = (SQLCHAR *) unicode_to_ansi_alloc( sqlstate, SQL_NTS, connection, NULL );
                         as2 = (SQLCHAR *) unicode_to_ansi_alloc( message_text, SQL_NTS, connection, NULL );
 
-                        sprintf( connection -> msg, "\t\tDIAG [%s] %s",
-                                as1, as2 );
+                        if ( as1 && as2 ) {
+                            sprintf( connection -> msg, "\t\tDIAG [%s] %s", as1, as2 );
+                        }
 
                         if ( as1 ) free( as1 );
                         if ( as2 ) free( as2 );
@@ -4468,8 +4649,8 @@ retry:
                         as1 = (SQLCHAR *) unicode_to_ansi_alloc( sqlstate, SQL_NTS, connection, NULL );
                         as2 = (SQLCHAR *) unicode_to_ansi_alloc( message_text, SQL_NTS, connection, NULL );
 
-                        sprintf( connection -> msg, "\t\tDIAG [%s] %s",
-                                as1, as2 );
+                        if (as1 && as2)
+                                sprintf( connection -> msg, "\t\tDIAG [%s] %s", as1, as2 );
 
                         if ( as1 ) free( as1 );
                         if ( as2 ) free( as2 );

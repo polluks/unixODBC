@@ -587,11 +587,11 @@ retry:
 
         connection -> dsn_length = 0;
 
-        strcpy( connection -> server, "" );
+        connection -> _server = strdup( "" );
         connection -> server_length = 0;
-        strcpy( connection -> user, "" );
+        connection -> _user = strdup( "" );
         connection -> user_length = 0;
-        strcpy( connection -> password, "" );
+        connection -> _password = strdup( "" );
         connection -> password_length = 0;
 
         if ( len_conn_str_in == SQL_NTS )
@@ -1098,7 +1098,7 @@ retry:
         ret_from_connect = SQL_SUCCESS_WITH_INFO;
     }
 
-    if ( pooling_enabled  && !add_to_pool( connection, pooh ) )
+    if ( pooling_enabled && !add_to_pool( connection, pooh ) )
     {
         pool_unreserve( pooh );
     }

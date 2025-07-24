@@ -413,11 +413,8 @@ static SQLRETURN extract_sql_error_rec( EHEAD *head,
 
             if ( SQL_SUCCEEDED( ret ) && sqlstate )
             {
-                if ( sqlstate )
-                {
-                    unicode_to_ansi_copy((char*) sqlstate, 6, s1, SQL_NTS, __get_connection( head ), NULL );
-                    __map_error_state((char*) sqlstate, __get_version( head ));
-                }
+                unicode_to_ansi_copy((char*) sqlstate, 6, s1, SQL_NTS, __get_connection( head ), NULL );
+                __map_error_state((char*) sqlstate, __get_version( head ));
                 if ( message_text )
                 {
                     unicode_to_ansi_copy((char*) message_text, buffer_length, s2, SQL_NTS, __get_connection( head ), NULL );
@@ -561,7 +558,7 @@ SQLRETURN SQLGetDiagRec( SQLSMALLINT handle_type,
         SQLSMALLINT *text_length_ptr )
 {
     SQLRETURN ret;
-    SQLCHAR s0[ 48 ], s1[ 100 + LOG_MESSAGE_LEN ];
+    SQLCHAR s0[ 64 ], s1[ 100 + LOG_MESSAGE_LEN ];
     SQLCHAR s2[ 100 + LOG_MESSAGE_LEN ];
 
     DMHENV environment = ( DMHENV ) handle;

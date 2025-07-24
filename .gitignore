@@ -1,6 +1,7 @@
+*.la
+*.pc
 *.lo
 *.o
-INSTALL
 /libltdl
 
 # From https://github.com/github/gitignore/blob/main/Autotools.gitignore

@@ -16,6 +16,9 @@
 #ifdef HAVE_TIME_H
 #include <time.h>
 #endif
+#ifdef HAVE_UNISTD_H
+#include <unistd.h> 
+#endif
 
 #ifdef HAVE_SYNCH_H
 #include <synch.h>
@@ -299,6 +302,7 @@ typedef struct environment
     int             fetch_mode;         /* for SQLDataSources */
     int             entry;
     void            *sh;                /* statistics handle */
+    int             released;           /* Catch a race condition in SQLAPI lib */
     struct env_lib_struct *env_lib_list;/* use this to avoid multiple AllocEnv in the driver */
 } *DMHENV;
 
@@ -383,11 +387,11 @@ typedef struct connection
     int             ttl;
     char            *_driver_connect_string;
     int             dsn_length;
-    char            server[ 128 ];
+    char            *_server;
     int             server_length;
-    char            user[ 128 ];
+    char            *_user;
     int             user_length;
-    char            password[ 128 ];
+    char            *_password;
     int             password_length;
     char            cli_year[ 5 ];
     struct attr_struct  env_attribute;      /* Extended attribute set info */
@@ -427,14 +431,14 @@ typedef struct connection_pool_head
 
     char    *_driver_connect_string;
     int     dsn_length;
-    char    server[ 128 ];
+    char    *_server;
     int     server_length;
-    char    user[ 128 ];
+    char    *_user;
     int     user_length;
-    char    password[ 128 ];
+    char    *_password;
     int     password_length;
 
-    int     num_entries;                /* always at least 1 */
+    volatile int num_entries;                /* always at least 1 */
     CPOOLENT *entries;
 } CPOOLHEAD;
 
@@ -547,9 +551,11 @@ void __handle_attr_extensions( DMHDBC connection, char *dsn, char *driver_name )
  * handle allocation functions
  */
 
+DMHENV __share_env( int *first );
 DMHENV __alloc_env( void );
 int __validate_env( DMHENV );
 void __release_env( DMHENV environment );
+int __validate_env_mark_released( DMHENV env );
 
 DMHDBC __alloc_dbc( void );
 int __validate_dbc( DMHDBC );
@@ -1170,7 +1176,7 @@ int add_to_pool( DMHDBC connection, CPOOLHEAD *pooh );
                                         (stmt,pn,dtp,psp,ddp,np)
 
 #define DM_SQLDISCONNECT            21
-#define CHECK_SQLDISCONNECT(con)    (con->functions[21].func!=NULL)
+#define CHECK_SQLDISCONNECT(con)    (con->functions!=NULL && con->functions[21].func!=NULL)
 #define SQLDISCONNECT(con,dbc)\
                                     ((SQLRETURN (*)(SQLHDBC))\
                                     con->functions[21].func)(dbc)
