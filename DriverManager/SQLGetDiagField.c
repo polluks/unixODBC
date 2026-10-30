@@ -197,8 +197,6 @@
 #include <config.h>
 #include "drivermanager.h"
 
-static char const rcsid[]= "$RCSfile: SQLGetDiagField.c,v $ $Revision: 1.17 $";
-
 #define ODBC30_SUBCLASS        "01S00,01S01,01S02,01S06,01S07,07S01,08S01,21S01,\
 21S02,25S01,25S02,25S03,42S01,42S02,42S11,42S12,42S21,42S22,HY095,HY097,HY098,\
 HY099,HY100,HY101,HY105,HY107,HY109,HY110,HY111,HYT00,HYT01,IM001,IM002,IM003,\
@@ -366,7 +364,7 @@ static SQLRETURN extract_sql_error_field( EHEAD *head,
 
                 if ( buffer_length > 0 )
                 {
-                    s1 = malloc( sizeof( SQLWCHAR ) * ( buffer_length + 1 ));
+                    s1 = calloc( buffer_length + 1, sizeof( SQLWCHAR ));
                 }
                 
                 ret = SQLGETDIAGFIELDW( __get_connection( head ),
@@ -547,7 +545,7 @@ static SQLRETURN extract_sql_error_field( EHEAD *head,
 
             if ( diag_info_ptr && buffer_length > 0 )
             {
-                s1 = malloc( ( buffer_length + 1 ) * sizeof( SQLWCHAR ));
+                s1 = calloc( buffer_length + 1, sizeof( SQLWCHAR ));
             }
 
             ret = SQLGETDIAGFIELDW( __get_connection( head ),
@@ -561,6 +559,11 @@ static SQLRETURN extract_sql_error_field( EHEAD *head,
 
             if ( SQL_SUCCEEDED( ret ) && s1 && diag_info_ptr )
             {
+                /*
+                 * the driver may not terminate the string in our units
+                 */
+
+                s1[ buffer_length ] = 0;
                 unicode_to_ansi_copy( diag_info_ptr, buffer_length, s1, SQL_NTS, __get_connection( head ), NULL );
 
                 if ( string_length_ptr && *string_length_ptr > 0 ) 
@@ -959,6 +962,8 @@ SQLRETURN SQLGetDiagField( SQLSMALLINT handle_type,
      * Do diag extraction here if defer flag is set.
      * Clean the flag after extraction.
      */
+    error_head_lock( herror );
+
     if ( connection && herror->defer_extract )
     {
         extract_error_from_driver( herror, connection, herror->ret_code_deferred, 0 );
@@ -973,6 +978,8 @@ SQLRETURN SQLGetDiagField( SQLSMALLINT handle_type,
             diag_info_ptr,
             buffer_length,
             string_length_ptr );
+
+    error_head_unlock( herror );
 
     if ( log_info.log_flag )
     {

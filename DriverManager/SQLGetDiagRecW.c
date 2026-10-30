@@ -96,8 +96,6 @@
 #include <config.h>
 #include "drivermanager.h"
 
-static char const rcsid[]= "$RCSfile: SQLGetDiagRecW.c,v $";
-
 extern int __is_env( EHEAD * head );        /* in SQLGetDiagRec.c */
 
 SQLRETURN extract_parent_handle_rec( DRV_SQLHANDLE handle,
@@ -300,14 +298,19 @@ static SQLRETURN extract_sql_error_rec_w( EHEAD *head,
         {
             SQLCHAR *as1 = NULL, *as2 = NULL;
 
+            /*
+             * cleared and terminated below, as the driver may not
+             * terminate them
+             */
+
             if ( sqlstate )
             {
-                as1 = malloc( 7 );
+                as1 = calloc( 7, 1 );
             }
 
             if ( message_text && buffer_length > 0 )
             {
-                as2 = malloc( buffer_length + 1 );
+                as2 = calloc( buffer_length + 1, 1 );
             }
                 
             ret = SQLGETDIAGREC( __get_connection( head ),
@@ -323,6 +326,18 @@ static SQLRETURN extract_sql_error_rec_w( EHEAD *head,
             /*
              * map 3 to 2 if required
              */
+
+            if ( SQL_SUCCEEDED( ret ))
+            {
+                if ( as1 )
+                {
+                    as1[ 5 ] = '\0';
+                }
+                if ( as2 )
+                {
+                    as2[ buffer_length - 1 ] = '\0';
+                }
+            }
 
             if ( SQL_SUCCEEDED( ret ) && sqlstate )
             {
@@ -539,6 +554,8 @@ SQLRETURN SQLGetDiagRecW( SQLSMALLINT handle_type,
      * Do diag extraction here if defer flag is set.
      * Clean the flag after extraction.
      */
+    error_head_lock( herror );
+
     if ( connection && herror->defer_extract )
     {
         extract_error_from_driver( herror, connection, herror->ret_code_deferred, 0 );
@@ -554,6 +571,8 @@ SQLRETURN SQLGetDiagRecW( SQLSMALLINT handle_type,
             message_text,
             buffer_length,
             text_length_ptr );
+
+    error_head_unlock( herror );
 
     if ( log_info.log_flag )
     {

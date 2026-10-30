@@ -509,8 +509,6 @@ static t_enc lookuptable[] = {
 
 #include "drivermanager.h"
 
-static char const rcsid[]= "$RCSfile: __info.c,v $ $Revision: 1.50 $";
-
 struct log_structure log_info = { NULL, NULL, 0, 0 };
 
 SQLINTEGER ODBCSharedTraceFlag = 0;
@@ -4098,8 +4096,10 @@ void __post_internal_error_ex_noprefix( EHEAD *error_header,
      * errors in the same list
      */
 
+    error_head_lock( error_header );
     insert_into_error_list( error_header, e1 );
     insert_into_diag_list( error_header, e2 );
+    error_head_unlock( error_header );
 }
 
 void __post_internal_error_ex_w( EHEAD *error_header,
@@ -4204,6 +4204,8 @@ void __post_internal_error_ex_w_noprefix( EHEAD *error_header,
     e1 -> diag_server_name[ 0 ] = 0;
     e2 -> diag_server_name[ 0 ] = 0;
 
+    error_head_lock( error_header );
+
     error_header -> return_code = SQL_ERROR;
 
     /*
@@ -4213,6 +4215,8 @@ void __post_internal_error_ex_w_noprefix( EHEAD *error_header,
 
     insert_into_error_list( error_header, e1 );
     insert_into_diag_list( error_header, e2 );
+
+    error_head_unlock( error_header );
 }
 
 /*
@@ -4222,6 +4226,7 @@ void __post_internal_error_ex_w_noprefix( EHEAD *error_header,
 void setup_error_head( EHEAD *error_header, void *handle, int type )
 {
     memset( error_header, 0, sizeof( *error_header ));
+    error_head_mutex_init( error_header );
 
     error_header -> owning_handle = handle;
     error_header -> handle_type = type;
@@ -4234,6 +4239,8 @@ void setup_error_head( EHEAD *error_header, void *handle, int type )
 void clear_error_head( EHEAD *error_header )
 {
     ERROR *cur, *prev;
+
+    error_head_lock( error_header );
 
     prev = NULL;
     cur = error_header -> sql_error_head.error_list_head;
@@ -4279,11 +4286,64 @@ void clear_error_head( EHEAD *error_header )
 
     error_header -> sql_diag_head.internal_list_head = NULL;
     error_header -> sql_diag_head.internal_list_tail = NULL;
+
+    error_head_unlock( error_header );
+    error_head_mutex_destroy( error_header );
 }
 
 /*
  * get the error values from the handle
  */
+
+/*
+ * A driver may not terminate the diagnostic strings it returns in the units
+ * the DM expects (for example when its wide functions use a different
+ * encoding), and the length it reports may not match what it wrote. Buffers
+ * that receive driver diagnostic text are therefore cleared before the call,
+ * allocated with DIAG_BUFFER_BYTES_PER_CHAR bytes per character so that a
+ * driver writing in a wider or multi-byte encoding stays inside them, and
+ * terminated at the BufferLength passed to the driver after the call. The
+ * text then ends at the driver's own terminator or at BufferLength, never
+ * past the buffer, and the copies made from it are sized from the resulting
+ * string, not from the length the driver reported.
+ */
+
+#define DIAG_BUFFER_BYTES_PER_CHAR  4
+
+#define DIAG_WIDE_FIELD_CHARS( f )  ( sizeof( f ) / sizeof( SQLWCHAR ) - 1 )
+
+#define DIAG_TERMINATE_WIDE_FIELD( f )  ( f )[ DIAG_WIDE_FIELD_CHARS( f ) ] = 0
+
+/*
+ * BufferLength to use when fetching a message again after the driver
+ * reported that it did not fit
+ */
+
+static SQLSMALLINT diag_refetch_length( SQLSMALLINT len )
+{
+    if ( len < 0 )
+    {
+        len = 0;
+    }
+    else if ( len > 32766 )
+    {
+        len = 32766;
+    }
+
+    return len + 1;
+}
+
+static SQLCHAR *diag_buffer( SQLSMALLINT buffer_length )
+{
+    return calloc( buffer_length, DIAG_BUFFER_BYTES_PER_CHAR );
+}
+
+static SQLWCHAR *diag_buffer_w( SQLSMALLINT buffer_length )
+{
+    return calloc( buffer_length,
+            sizeof( SQLWCHAR ) > DIAG_BUFFER_BYTES_PER_CHAR ?
+                sizeof( SQLWCHAR ) : DIAG_BUFFER_BYTES_PER_CHAR );
+}
 
 void extract_diag_error( int htype,
                             DRV_SQLHANDLE handle,
@@ -4301,6 +4361,8 @@ void extract_diag_error( int htype,
     SQLINTEGER rec_number;
     SQLSMALLINT len;
     
+    error_head_lock( head );
+
     head -> return_code = return_code;
     head -> header_set = 0;
     head -> diag_cursor_row_count_ret = SQL_ERROR;
@@ -4315,7 +4377,12 @@ void extract_diag_error( int htype,
         len = 0;
 
         msg1_len = SQL_MAX_MESSAGE_LENGTH + 1;
-        msg1 = malloc( msg1_len );
+        msg1 = diag_buffer( msg1_len );
+
+        if ( !msg1 )
+        {
+            break;
+        }
 
         ret = SQLGETDIAGREC( connection,
                 head -> handle_type,
@@ -4337,21 +4404,50 @@ void extract_diag_error( int htype,
              */
 
             if ( ret == SQL_SUCCESS_WITH_INFO || len >= SQL_MAX_MESSAGE_LENGTH ) {
-                msg1 = realloc( msg1, len + 1 );
-                msg1_len = len + 1;
+                SQLSMALLINT msg2_len = diag_refetch_length( len );
+                SQLCHAR *msg2 = diag_buffer( msg2_len );
+                SQLCHAR sqlstate2[ 6 ];
+                SQLINTEGER native2;
+                SQLRETURN ret2 = SQL_ERROR;
 
-                ret = SQLGETDIAGREC( connection,
-                        head -> handle_type,
-                        handle,
-                        rec_number,
-                        sqlstate,
-                        &native,
-                        msg1,
-                        msg1_len,
-                        &len );
+                memset( sqlstate2, 0, sizeof( sqlstate2 ));
+
+                if ( msg2 )
+                {
+                    ret2 = SQLGETDIAGREC( connection,
+                            head -> handle_type,
+                            handle,
+                            rec_number,
+                            sqlstate2,
+                            &native2,
+                            msg2,
+                            msg2_len,
+                            &len );
+                }
+
+                /*
+                 * keep the first result if the second call failed
+                 */
+
+                if ( SQL_SUCCEEDED( ret2 ))
+                {
+                    free( msg1 );
+                    msg1 = msg2;
+                    msg1_len = msg2_len;
+                    memcpy( sqlstate, sqlstate2, sizeof( sqlstate ));
+                    native = native2;
+                    ret = ret2;
+                }
+                else
+                {
+                    free( msg2 );
+                }
             }
 
-            msg_len = len + 32;
+            msg1[ msg1_len - 1 ] = '\0';
+            sqlstate[ 5 ] = '\0';
+
+            msg_len = strlen((char*) msg1 ) + 32;
             msg = malloc( msg_len );
 
 #ifdef STRICT_ODBC_ERROR
@@ -4420,6 +4516,8 @@ void extract_diag_error( int htype,
                             0,
                             NULL );
 
+                        memset( msg, 0, msg_len );
+
                         if ( SQL_SUCCEEDED( head -> diag_dynamic_function_ret = SQLGETDIAGFIELD( connection,
                             head -> handle_type,
                             handle,
@@ -4429,8 +4527,9 @@ void extract_diag_error( int htype,
                             msg_len,
                             &len )))
                         {
-                            tmp = ansi_to_unicode_alloc(msg, SQL_NTS, connection, NULL );
-                            wide_strcpy( head->diag_dynamic_function, tmp );
+                            msg[ msg_len - 1 ] = '\0';
+                            tmp = ansi_to_unicode_alloc( msg, SQL_NTS, connection, NULL );
+                            wide_strncpy( head->diag_dynamic_function, tmp, DIAG_WIDE_FIELD_CHARS( head->diag_dynamic_function ));
                             free( tmp );
                         }
 
@@ -4489,6 +4588,8 @@ void extract_diag_error( int htype,
                     e -> diag_connection_name_ret = SQL_ERROR;
                     e -> diag_server_name_ret= SQL_ERROR;
 
+                    memset( msg, 0, msg_len );
+
                     if ( SQL_SUCCEEDED( e -> diag_class_origin_ret = SQLGETDIAGFIELD( connection,
                         head -> handle_type,
                         handle,
@@ -4498,10 +4599,13 @@ void extract_diag_error( int htype,
                         msg_len,
                         &len )))
                     {
+                        msg[ msg_len - 1 ] = '\0';
                         tmp = ansi_to_unicode_alloc( msg, SQL_NTS, connection, NULL );
-                        wide_strcpy( e->diag_class_origin, tmp );
+                        wide_strncpy( e->diag_class_origin, tmp, DIAG_WIDE_FIELD_CHARS( e->diag_class_origin ));
                         free( tmp );
                     }
+
+                    memset( msg, 0, msg_len );
 
                     if ( SQL_SUCCEEDED( e -> diag_subclass_origin_ret = SQLGETDIAGFIELD( connection,
                         head -> handle_type,
@@ -4512,10 +4616,13 @@ void extract_diag_error( int htype,
                         msg_len,
                         &len )))
                     {
-                        tmp = ansi_to_unicode_alloc(msg, SQL_NTS, connection, NULL );
-                        wide_strcpy( e->diag_subclass_origin, tmp );
+                        msg[ msg_len - 1 ] = '\0';
+                        tmp = ansi_to_unicode_alloc( msg, SQL_NTS, connection, NULL );
+                        wide_strncpy( e->diag_subclass_origin, tmp, DIAG_WIDE_FIELD_CHARS( e->diag_subclass_origin ));
                         free( tmp );
                     }
+
+                    memset( msg, 0, msg_len );
 
                     if ( SQL_SUCCEEDED( e -> diag_connection_name_ret = SQLGETDIAGFIELD( connection,
                         head -> handle_type,
@@ -4526,10 +4633,13 @@ void extract_diag_error( int htype,
                         msg_len,
                         &len )))
                     {
+                        msg[ msg_len - 1 ] = '\0';
                         tmp = ansi_to_unicode_alloc( msg, SQL_NTS, connection, NULL );
-                        wide_strcpy( e->diag_connection_name, tmp );
+                        wide_strncpy( e->diag_connection_name, tmp, DIAG_WIDE_FIELD_CHARS( e->diag_connection_name ));
                         free( tmp );
                     }
+
+                    memset( msg, 0, msg_len );
 
                     if ( SQL_SUCCEEDED( e -> diag_server_name_ret = SQLGETDIAGFIELD( connection,
                         head -> handle_type,
@@ -4540,8 +4650,9 @@ void extract_diag_error( int htype,
                         msg_len,
                         &len )))
                     {
+                        msg[ msg_len - 1 ] = '\0';
                         tmp = ansi_to_unicode_alloc( msg, SQL_NTS, connection, NULL );
-                        wide_strcpy( e -> diag_server_name, tmp );
+                        wide_strncpy( e -> diag_server_name, tmp, DIAG_WIDE_FIELD_CHARS( e -> diag_server_name ));
                         free( tmp );
                     }
                 }
@@ -4578,6 +4689,8 @@ void extract_diag_error( int htype,
         }
     }
     while( SQL_SUCCEEDED( ret ));
+
+    error_head_unlock( head );
 }
 
 void extract_sql_error( DRV_SQLHANDLE henv,
@@ -4594,6 +4707,8 @@ void extract_sql_error( DRV_SQLHANDLE henv,
     SQLINTEGER native;
     SQLSMALLINT len;
 
+    error_head_lock( head );
+
     head -> return_code = return_code;
     head -> header_set = 0;
     head -> diag_cursor_row_count_ret = SQL_ERROR;
@@ -4605,6 +4720,8 @@ void extract_sql_error( DRV_SQLHANDLE henv,
     do
     {
         len = 0;
+
+        memset( msg1, 0, sizeof( msg1 ));
 
         ret = SQLERROR( connection,
                 henv, 
@@ -4633,9 +4750,8 @@ void extract_sql_error( DRV_SQLHANDLE henv,
              * make sure we are truncated in the right place
              */
 
-            if ( ret == SQL_SUCCESS_WITH_INFO || len >= SQL_MAX_MESSAGE_LENGTH ) {
-                msg1[ SQL_MAX_MESSAGE_LENGTH ] = '\0';
-            }
+            msg1[ SQL_MAX_MESSAGE_LENGTH ] = '\0';
+            sqlstate[ 5 ] = '\0';
 
 #ifdef STRICT_ODBC_ERROR
             strcpy((char*) msg, (char*)msg1 );
@@ -4694,6 +4810,8 @@ void extract_sql_error( DRV_SQLHANDLE henv,
         }
     }
     while( SQL_SUCCEEDED( ret ));
+
+    error_head_unlock( head );
 }
 
 void extract_diag_error_w( int htype,
@@ -4706,10 +4824,13 @@ void extract_diag_error_w( int htype,
     SQLRETURN ret;
     SQLWCHAR *msg;
     SQLWCHAR *msg1;
-    SQLWCHAR sqlstate[ 6 ];
+    SQLSMALLINT msg1_len;
+    SQLWCHAR sqlstate[ 6 * 2 ];     /* double size to handle incorrect driver SQLWCHAR size */
     SQLINTEGER native;
     SQLINTEGER rec_number;
     SQLSMALLINT len;
+
+    error_head_lock( head );
 
     head -> return_code = return_code;
     head -> header_set = 0;
@@ -4724,7 +4845,17 @@ void extract_diag_error_w( int htype,
     {
         len = 0;
 
-        msg1 = malloc(( SQL_MAX_MESSAGE_LENGTH + 1 ) * sizeof( SQLWCHAR ));
+        msg1_len = SQL_MAX_MESSAGE_LENGTH + 1;
+        msg1 = diag_buffer_w( msg1_len );
+
+        if ( !msg1 )
+        {
+            break;
+        }
+
+        if ( sizeof( SQLWCHAR ) == 2 ) {
+            memset( sqlstate, 0xFF, sizeof( sqlstate ));
+        }
 
         ret = SQLGETDIAGRECW( connection,
                 head -> handle_type,
@@ -4733,7 +4864,7 @@ void extract_diag_error_w( int htype,
                 sqlstate,
                 &native,
                 msg1,
-                SQL_MAX_MESSAGE_LENGTH + 1,
+                msg1_len,
                 &len );
 
         if ( SQL_SUCCEEDED( ret ))
@@ -4743,24 +4874,62 @@ void extract_diag_error_w( int htype,
             SQLWCHAR *tmp;
 #endif
 
+            if ( sizeof( SQLWCHAR ) == 2 ) {
+                if ( sqlstate[ 6 ] != 0xFFFF ) {
+                    fprintf( stderr, "Fatal Error: Mismatch detected between unixODBC and ODBC Driver SQLWCHAR size. Terminated\n" );
+                    abort();
+                }
+            }
+
             /* 
              * make sure we are truncated in the right place
              */
 
             if ( ret == SQL_SUCCESS_WITH_INFO || len >= SQL_MAX_MESSAGE_LENGTH ) {
-                msg1 = realloc( msg1, ( len + 1 ) * sizeof( SQLWCHAR ));
-                ret = SQLGETDIAGRECW( connection,
-                        head -> handle_type,
-                        handle,
-                        rec_number,
-                        sqlstate,
-                        &native,
-                        msg1,
-                        len + 1,
-                        &len );
+                SQLSMALLINT msg2_len = diag_refetch_length( len );
+                SQLWCHAR *msg2 = diag_buffer_w( msg2_len );
+                SQLWCHAR sqlstate2[ 6 * 2 ];
+                SQLINTEGER native2;
+                SQLRETURN ret2 = SQL_ERROR;
+
+                memset( sqlstate2, 0, sizeof( sqlstate2 ));
+
+                if ( msg2 )
+                {
+                    ret2 = SQLGETDIAGRECW( connection,
+                            head -> handle_type,
+                            handle,
+                            rec_number,
+                            sqlstate2,
+                            &native2,
+                            msg2,
+                            msg2_len,
+                            &len );
+                }
+
+                /*
+                 * keep the first result if the second call failed
+                 */
+
+                if ( SQL_SUCCEEDED( ret2 ))
+                {
+                    free( msg1 );
+                    msg1 = msg2;
+                    msg1_len = msg2_len;
+                    memcpy( sqlstate, sqlstate2, sizeof( sqlstate ));
+                    native = native2;
+                    ret = ret2;
+                }
+                else
+                {
+                    free( msg2 );
+                }
             }
 
-            msg = malloc(( len + 32 ) * sizeof( SQLWCHAR ));
+            msg1[ msg1_len - 1 ] = 0;
+            sqlstate[ 5 ] = 0;
+
+            msg = malloc(( wide_strlen( msg1 ) + 32 ) * sizeof( SQLWCHAR ));
 
 #ifdef STRICT_ODBC_ERROR
             wide_strcpy( msg, msg1 );
@@ -4789,7 +4958,7 @@ void extract_diag_error_w( int htype,
 
             if ( save_to_diag )
             {
-                e = malloc( sizeof( ERROR ));
+                e = calloc( 1, sizeof( ERROR ));
                 e -> native_error = native;
                 wide_strcpy( e -> sqlstate, sqlstate );
                 e -> msg = wide_strdup( msg );
@@ -4824,6 +4993,8 @@ void extract_diag_error_w( int htype,
                             0,
                             NULL );
 
+                        memset( head->diag_dynamic_function, 0, sizeof( head->diag_dynamic_function ));
+
                         head -> diag_dynamic_function_ret = SQLGETDIAGFIELDW( connection,
                             head -> handle_type,
                             handle,
@@ -4832,6 +5003,8 @@ void extract_diag_error_w( int htype,
                             head->diag_dynamic_function,
                             sizeof( head->diag_dynamic_function ),
                             &len );
+
+                        DIAG_TERMINATE_WIDE_FIELD( head->diag_dynamic_function );
 
                         head -> diag_dynamic_function_code_ret = SQLGETDIAGFIELDW( connection,
                             head -> handle_type,
@@ -4897,6 +5070,8 @@ void extract_diag_error_w( int htype,
                         sizeof( e->diag_class_origin ),
                         &len );
 
+                    DIAG_TERMINATE_WIDE_FIELD( e->diag_class_origin );
+
                     e -> diag_subclass_origin_ret = SQLGETDIAGFIELDW( connection,
                         head -> handle_type,
                         handle,
@@ -4905,6 +5080,8 @@ void extract_diag_error_w( int htype,
                         e->diag_subclass_origin,
                         sizeof( e->diag_subclass_origin ),
                         &len );
+
+                    DIAG_TERMINATE_WIDE_FIELD( e->diag_subclass_origin );
 
                     e -> diag_connection_name_ret = SQLGETDIAGFIELDW( connection,
                         head -> handle_type,
@@ -4915,6 +5092,8 @@ void extract_diag_error_w( int htype,
                         sizeof( e->diag_connection_name ),
                         &len );
 
+                    DIAG_TERMINATE_WIDE_FIELD( e->diag_connection_name );
+
                     e -> diag_server_name_ret = SQLGETDIAGFIELDW( connection,
                         head -> handle_type,
                         handle,
@@ -4923,6 +5102,8 @@ void extract_diag_error_w( int htype,
                         e->diag_server_name,
                         sizeof( e->diag_server_name ),
                         &len );
+
+                    DIAG_TERMINATE_WIDE_FIELD( e->diag_server_name );
                 }
             }
             else
@@ -4965,6 +5146,8 @@ void extract_diag_error_w( int htype,
         }
     }
     while( SQL_SUCCEEDED( ret ));
+
+    error_head_unlock( head );
 }
 
 void extract_sql_error_w( DRV_SQLHANDLE henv,
@@ -4975,17 +5158,25 @@ void extract_sql_error_w( DRV_SQLHANDLE henv,
                             int return_code )
 {
     SQLRETURN ret;
-    SQLWCHAR msg[ SQL_MAX_MESSAGE_LENGTH + 32 ];
-    SQLWCHAR msg1[ SQL_MAX_MESSAGE_LENGTH + 1 ];
-    SQLWCHAR sqlstate[ 6 ];
+    SQLWCHAR msg[ ( SQL_MAX_MESSAGE_LENGTH + 32 ) * 2  ];   /* double size to handle incorrect driver SQLWCHAR size */
+    SQLWCHAR msg1[ ( SQL_MAX_MESSAGE_LENGTH + 1 ) * 2 ];    /* double size to handle incorrect driver SQLWCHAR size */
+    SQLWCHAR sqlstate[ 6 * 2 ];                             /* double size to handle incorrect driver SQLWCHAR size */
     SQLINTEGER native;
     SQLSMALLINT len;
+
+    error_head_lock( head );
 
     head -> return_code = return_code;
 
     do
     {
         len = 0;
+
+        memset( msg1, 0, sizeof( msg1 ));
+
+        if ( sizeof( SQLWCHAR ) == 2 ) {
+            memset( sqlstate, 0xFF, sizeof( sqlstate ));
+        }
 
         ret = SQLERRORW( connection,
                 henv, 
@@ -5003,6 +5194,13 @@ void extract_sql_error_w( DRV_SQLHANDLE henv,
             SQLWCHAR *tmp;
 #endif
 
+            if ( sizeof( SQLWCHAR ) == 2 ) {
+                if ( sqlstate[ 6 ] != 0xFFFF ) {
+                    fprintf( stderr, "Fatal Error: Mismatch detected between unixODBC and ODBC Driver SQLWCHAR size. Terminated\n" );
+                    abort();
+                }
+            }
+
             /*
              * add to the lists, SQLError list first
              */
@@ -5017,9 +5215,8 @@ void extract_sql_error_w( DRV_SQLHANDLE henv,
              * make sure we are truncated in the right place
              */
 
-            if ( ret == SQL_SUCCESS_WITH_INFO || len >= SQL_MAX_MESSAGE_LENGTH ) {
-                msg1[ SQL_MAX_MESSAGE_LENGTH ] = 0;
-            }
+            msg1[ SQL_MAX_MESSAGE_LENGTH - 1 ] = 0;
+            sqlstate[ 5 ] = 0;
 
 #ifdef STRICT_ODBC_ERROR
             wide_strcpy( msg, msg1 );
@@ -5076,6 +5273,8 @@ void extract_sql_error_w( DRV_SQLHANDLE henv,
         }
     }
     while( SQL_SUCCEEDED( ret ));
+
+    error_head_unlock( head );
 }
 
 /*
@@ -5230,6 +5429,8 @@ int function_return_ex( int level, void * handle, int ret_code, int save_to_diag
 
         if ( herror )
         {
+            error_head_lock( herror );
+
             /*
              * set defer flag
              */
@@ -5243,6 +5444,8 @@ int function_return_ex( int level, void * handle, int ret_code, int save_to_diag
             {
                 extract_error_from_driver( herror, hdbc, ret_code, save_to_diag );
             }
+
+            error_head_unlock( herror );
         }
     }
 
@@ -5303,6 +5506,8 @@ void function_entry( void *handle )
         version = hdesc -> connection -> environment -> requested_version;
         break;
     }
+
+    error_head_lock( error_header );
 
     error_header->defer_extract = 0;
     error_header->ret_code_deferred = 0;
@@ -5365,6 +5570,8 @@ void function_entry( void *handle )
         error_header -> sql_error_head.error_list_tail = NULL;
         error_header -> sql_error_head.error_count = 0;
     }
+
+    error_head_unlock( error_header );
 }
 
 void __post_internal_error( EHEAD *error_handle,
@@ -5813,10 +6020,14 @@ void __post_internal_error_api( EHEAD *error_handle,
     strcpy((char*) msg, DM_ERROR_PREFIX );
     strncat((char*) msg, message, sizeof(msg) - sizeof(DM_ERROR_PREFIX) );
 
+    error_head_lock( error_handle );
+
     error_handle -> return_code = ret;
 
     __post_internal_error_ex( error_handle,
         (SQLCHAR*)sqlstate, 0, msg, class, subclass );
+
+    error_head_unlock( error_handle );
 }
 
 /*

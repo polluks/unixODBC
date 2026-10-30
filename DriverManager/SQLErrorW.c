@@ -88,8 +88,6 @@
 #include <config.h>
 #include "drivermanager.h"
 
-static char const rcsid[]= "$RCSfile: SQLErrorW.c,v $";
-
 SQLRETURN extract_parent_handle_err( int handle_type,
         SQLHENV environment_handle,
         SQLHDBC connection_handle,
@@ -383,6 +381,8 @@ SQLRETURN SQLErrorW( SQLHENV environment_handle,
      * Clean the flag after extraction.
      * The defer flag will not be set for DMHENV in function_return_ex.
      */
+    error_head_lock( herror );
+
     if ( connection && herror->defer_extract )
     {
         extract_error_from_driver( herror, connection, herror->ret_code_deferred, 0 );
@@ -397,6 +397,8 @@ SQLRETURN SQLErrorW( SQLHENV environment_handle,
             message_text,
             buffer_length,
             text_length );
+
+    error_head_unlock( herror );
 
     if ( log_info.log_flag )
     {

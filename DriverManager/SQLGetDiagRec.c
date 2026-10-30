@@ -183,8 +183,6 @@
 #include <config.h>
 #include "drivermanager.h"
 
-static char const rcsid[]= "$RCSfile: SQLGetDiagRec.c,v $ $Revision: 1.21 $";
-
 int __is_env( EHEAD * head )
 {
     int type;
@@ -387,11 +385,16 @@ static SQLRETURN extract_sql_error_rec( EHEAD *head,
 
 		rec_number -= head -> sql_diag_head.internal_count;
 
-        s1 = malloc( sizeof( SQLWCHAR ) * ( 6 + 1 ));
+        /*
+         * cleared, with room for a driver with a mismatched SQLWCHAR, and
+         * terminated below, as the driver may not terminate them in our units
+         */
+
+        s1 = calloc(( 6 + 1 ) * 2, sizeof( SQLWCHAR ));
 
         if ( buffer_length > 0 )
         {
-            s2 = malloc( sizeof( SQLWCHAR ) * ( buffer_length + 1 ));
+            s2 = calloc(( buffer_length + 1 ) * 2, sizeof( SQLWCHAR ));
         }
 
         if ( __get_connection( head ) -> unicode_driver &&
@@ -410,6 +413,18 @@ static SQLRETURN extract_sql_error_rec( EHEAD *head,
             /*
              * map 3 to 2 if required
              */
+
+            if ( SQL_SUCCEEDED( ret ))
+            {
+                if ( s1 )
+                {
+                    s1[ 5 ] = 0;
+                }
+                if ( s2 )
+                {
+                    s2[ buffer_length - 1 ] = 0;
+                }
+            }
 
             if ( SQL_SUCCEEDED( ret ) && sqlstate )
             {
@@ -685,6 +700,8 @@ SQLRETURN SQLGetDiagRec( SQLSMALLINT handle_type,
      * Do diag extraction here if defer flag is set.
      * Clean the flag after extraction.
      */
+    error_head_lock( herror );
+
     if ( connection && herror->defer_extract )
     {
         extract_error_from_driver( herror, connection, herror->ret_code_deferred, 0 );
@@ -700,6 +717,8 @@ SQLRETURN SQLGetDiagRec( SQLSMALLINT handle_type,
             message_text,
             buffer_length,
             text_length_ptr );
+
+    error_head_unlock( herror );
 
     if ( log_info.log_flag )
     {
